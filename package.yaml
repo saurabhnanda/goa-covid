@@ -1,0 +1,73 @@
+name:                goa-covid
+version:             0.1.0.0
+#synopsis:
+#description:
+homepage:            https://github.com/saurabhnanda/goa-covid#readme
+license:             BSD3
+author:              Saurabh Nanda
+maintainer:          saurabhnanda@gmail.com
+copyright:           Saurabh Nanda
+category:            Web
+extra-source-files:
+- README.md
+
+default-extensions:
+- OverloadedStrings
+- RecordWildCards
+- DataKinds
+- DeriveGeneric
+- FlexibleInstances
+- FlexibleContexts
+- FunctionalDependencies
+- GeneralizedNewtypeDeriving
+- KindSignatures
+- MultiParamTypeClasses
+- TemplateHaskell
+- TypeFamilies
+- TypeSynonymInstances
+- QuasiQuotes
+- ScopedTypeVariables
+- LambdaCase
+- PolyKinds
+- TypeApplications
+- Arrows
+- ConstraintKinds
+- DuplicateRecordFields
+- DerivingStrategies
+- TypeOperators
+- NamedFieldPuns
+
+dependencies:
+  - base >= 4.7 && < 5
+  - servant
+  - text
+  - bytestring
+  - time
+  - uuid
+  - string-conv
+  - aeson
+  - aeson-casing
+  - mtl
+  - containers
+  - retry
+  - exceptions
+  - unliftio
+  - unliftio-core
+  - lens
+  - uri-bytestring
+  - http-client
+  - http-client-tls
+  - http-types
+  - servant
+  - servant-server
+  - servant-client
+  - servant-lucid
+  - lucid
+  - wai
+  - warp
+  
+
+executables:
+  goa-covid:
+    source-dirs:      src
+    main:             Main.hs
