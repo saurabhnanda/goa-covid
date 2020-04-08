@@ -65,9 +65,23 @@ dependencies:
   - lucid
   - wai
   - warp
-  
+  - foreign-store
+  - http-api-data
+  - template-haskell
+  - monad-validate
+  - tagsoup
+  - cookie
+  - servant-multipart
+  - concurrent-output
+  - exceptions
 
 executables:
   goa-covid:
     source-dirs:      src
     main:             Main.hs
+    ghc-options:
+      - -threaded
+      - -with-rtsopts=-N
+    other-modules:
+      - Env
+      - ZohoScraper

@@ -1,6 +1,7 @@
 module Main where
 
-import qualified Login
+-- import qualified Login
+import qualified ZohoScraper
 import Servant
 import Servant.Server
 import Servant.API
@@ -12,21 +13,29 @@ import Control.Monad.Reader
 import UnliftIO (liftIO)
 import Network.Wai
 import Network.Wai.Handler.Warp
+import System.Console.Concurrent
 
 type Routes =
-  (ToServant Login.Routes AsApi)
+  (ToServant ZohoScraper.Routes AsApi)
 
 server :: ServerT Routes AppM
-server = (toServant Login.server)
+server = (toServant ZohoScraper.server)
 
 routesProxy :: Proxy Routes
 routesProxy = Proxy
 
-main :: IO ()
-main = do
+startApp :: IO ()
+startApp = withConcurrentOutput $ do
   let env = Env
       appToHandler :: AppM a -> Handler a
       appToHandler action = liftIO $ runReaderT action env
+  putStrLn "Starting app..."
   run 8000 $
     serve routesProxy $
     hoistServer routesProxy appToHandler server
+
+stopApp :: IO ()
+stopApp = putStrLn "Stopping app..."
+
+main :: IO ()
+main = startApp
