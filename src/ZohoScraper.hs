@@ -396,7 +396,7 @@ shareForm flink emails = do
       if (responseStatus res) == ok200
         then do updateDb es
                 pure Nothing
-        else pure $ Just res
+        else pure $ Just $ responseBody res
 
     fetchExistingEmails = withDb $ \conn -> do
       liftIO $ DL.map (\(Only x) -> x) <$>

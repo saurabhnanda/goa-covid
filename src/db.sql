@@ -31,7 +31,6 @@ create table users_forms
 
 create unique index on users_forms(username, link_name);
 -- create index on users_forms(is_shared);
-       
 
 alter table users add column is_respondent boolean not null default false;
 alter table users add column zoho_user_id text ;

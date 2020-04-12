@@ -1,3 +1,4 @@
+{-# LANGUAGE PartialTypeSignatures #-}
 module Control
   ( module Control
   , module ZohoScraper
@@ -19,6 +20,12 @@ import Control.Lens
 import qualified Data.Text as T
 import Data.Ord
 import Data.Maybe
+import qualified Data.List.Split as Split
+import Control.Monad
+import UnliftIO
+import Database.PostgreSQL.Simple
+import Data.Either
+import Data.String.Conv
 
 spreadsheetIds =
   [ ("Salcette", "spreadsheet_id_was_here")
@@ -56,7 +63,7 @@ createForms blockName = do
     prepareForm g = do
       let villageName = (DL.head g) ^. _2
           waddoNames = DL.nub $ DL.sortBy (comparing T.toLower) $ DL.map (T.strip . (^. _3)) g
-          formName = villageName <> " (" <> blockName <> ")"
+          formName = villageFormName blockName villageName
       (duplicateFormIfRequired formName) >>= \case
         Left e -> pure $ Just e
         Right (_, _, flink, _) -> do
@@ -79,9 +86,45 @@ createForms blockName = do
               sayLine $ "Duplicated: " <> formName
               pure $ Right x
 
+villageFormName blockName villageName = villageName <> " (" <> blockName <> ")"
 
+credsFor x = ("p" <> x <> "@covid.vacationlabs.com", "covid@" <> (T.takeEnd 4 x))
+
+createMissingUsers :: T.Text -> IO ()
 createMissingUsers blockName = do
   env <- createEnv
   let sprId = fromJust $ DL.lookup blockName spreadsheetIds
-  userMapping <- runResourceT $ runGoogle env $ fetchVillageUserMapping sprId
-  pure userMapping
+  phones <-  runResourceT $ runGoogle env $ fetchAllPhones sprId
+  runApp $ do
+    results <- forM phones $ \phone -> do
+      let (username, password) = credsFor phone
+      withDb $ \conn -> liftIO $ try $ do
+        execute conn "insert into users (username, password) values (?, ?)" (username, password)
+    let (errs, successes) = partitionEithers results
+        finalErrs = (flip DL.concatMap) errs $ \(e :: SqlError) ->
+          if T.isInfixOf "duplicate key" (toS $ show e)
+          then []
+          else [e]
+    sayLine $ "(Existing, Inserted, Errors): " <> show (DL.length errs - DL.length finalErrs, DL.length successes, DL.length finalErrs)
+  pure ()
+
+mapUsersToVillages blockName = do
+  env <- createEnv
+  let sprId = fromJust $ DL.lookup blockName spreadsheetIds
+  rows :: [[(Int, T.Text, [T.Text])]] <-  runResourceT $ runGoogle env $ fetchVillageUserMapping sprId
+  runApp $  S.toList $
+    S.maxThreads 10 $
+    S.asyncly $
+    S.mapM go $
+    S.fromList $
+    rows
+  where
+    -- go :: [(Int, T.Text, [T.Text])] -> _ 
+    go grp = do
+      let (_, villageName, _) = (DL.head grp)
+      (fetchKnownFormByName (villageFormName blockName villageName)) >>= \case
+        Nothing -> pure ["Unknown form " <> toS villageName]
+        Just (_, _, flink, _) -> do
+          let allphones = DL.concatMap (^. _3) grp
+              emails = DL.map (fst . credsFor) allphones
+          shareForm flink emails

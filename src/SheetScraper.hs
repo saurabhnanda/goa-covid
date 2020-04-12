@@ -42,11 +42,28 @@ fetchVillageWaddoMapping sprId = do
       x -> Left (i, r)
 
 
+fetchAllPhones sprId = do
+  vrange <- send $ spreadsheetsValuesGet sprId "Teams"
+  let (errs, rows) = partitionEithers $ DL.zipWith extract (DL.tail $ vrange ^. vrValues) [1..]
+  pure $ DL.concat rows
+  where
+    extract r i = case r of
+      (String _):(String _):(String _):ps ->
+        Right $ DL.concatMap cleanup ps
+      x ->
+        Left (i, r)
+
+    cleanup (Aeson.String x) =
+      if T.strip x==""
+      then []
+      else [T.strip x]
+
+
+-- fetchVillageUserMapping :: _ -> _ [[(Int, Text, [Text])]]
 fetchVillageUserMapping sprId = do
   vrange <- send $ spreadsheetsValuesGet sprId "Teams"
   let (errs, rows) = partitionEithers $ DL.zipWith extract (DL.tail $ vrange ^. vrValues) [1..]
   pure $ DL.groupBy (\x y -> (x ^. _2) == (y ^. _2)) $ DL.sortOn (^. _2) rows
-  -- pure (errs, rows)
   where
     extract r i = case r of
       (String _):(String village):(String _):ps ->
