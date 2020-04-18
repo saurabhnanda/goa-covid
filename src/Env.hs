@@ -1,3 +1,5 @@
+{-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE PartialTypeSignatures #-}
 module Env where
 
 import Control.Monad.Reader
@@ -15,12 +17,22 @@ import Control.Monad.Catch as E (MonadMask, Handler(..))
 import Control.Concurrent.TokenBucket
 import qualified Data.ByteString as BS
 import GHC.Word
+import qualified Network.Google as Google hiding (setBody)
+import qualified Network.Google.Auth as Google
+import qualified Network.HTTP.Client.TLS as Google
+import qualified Network.Google.Sheets.Types as Google
+import Network.HTTP.Client.TLS
+import Database.PostgreSQL.Simple.FromField
+import Database.PostgreSQL.Simple.ToField
+import GHC.Generics
+import Data.Text (Text)
 
 data Env = Env
   { envDbPool :: Pool Connection
   , envTokenBucket :: !TokenBucket
   , envBurstSize :: !Word64
   , envInvRate :: !Word64
+  , envGoogle :: Google.Env '["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive.file"]
   }
 
 type AppM = ReaderT Env IO
@@ -40,10 +52,16 @@ withRateLimiting action = do
   liftIO $ tokenBucketWait envTokenBucket envBurstSize envInvRate
   action
 
+createGoogleEnv = do
+  creds <- Google.fromFilePath "gauth.json"
+  mgr <- getGlobalManager
+  (Google.allow (Google.spreadsheetsScope Google.! Google.driveFileScope)) <$> (Google.newEnvWith creds noLogger mgr)
+
 withEnv :: (Env -> IO a) -> IO a
 withEnv action = do
   withPool $ \envDbPool -> do
     envTokenBucket <- newTokenBucket
+    envGoogle <- createGoogleEnv
     let envBurstSize = 10
         envInvRate = round (1e6 / 0.6667)
     action Env{..}
@@ -135,3 +153,17 @@ retryOnTemporaryNetworkErrors action = Retry.recovering
 
 isGet :: Request -> Bool
 isGet req = HT.methodGet == (HC.method req)
+
+noLogger :: _ -> _ -> IO ()
+noLogger = const $ const $ pure ()
+
+
+villageFormName blockName villageName = villageName <> " (" <> blockName <> ")"
+
+
+newtype FormLinkName = FormLinkName {unFormLinkName :: Text} deriving (Eq, Show, Generic, FromField, ToField)
+newtype ReportLinkName = ReportLinkName {unReportLinkName :: Text} deriving (Eq, Show, Generic, FromField, ToField)
+newtype FormId = FormId {unFormId :: Int} deriving (Eq, Show, Generic, FromField, ToField)
+newtype UserId = UserId {unUserId :: Int} deriving (Eq, Show, Generic, FromField, ToField)
+newtype ZohoUserId = ZohoUserId {unZohoUserId :: Text} deriving (Eq, Show, Generic, FromField, ToField)
+newtype ZohoFormId = ZohoFormId {unZohoFormId :: Text} deriving (Eq, Show, Generic, FromField, ToField)

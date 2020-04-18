@@ -87,8 +87,23 @@ dependencies:
   - gogol-oauth2
   - gogol-drive
   - token-bucket
+  - directory
+  - filepath
 
 executables:
+  csv-exporter:
+    source-dirs: src
+    main: CsvExporter.hs
+    ghc-options:
+      - -threaded
+      - -with-rtsopts=-N
+      - -main-is CsvExporter
+    other-modules:
+      - Env
+      - SheetScraper
+      - Stats
+      - ZohoScraper
+
   goa-covid:
     source-dirs:      src
     main:             Main.hs
@@ -98,3 +113,5 @@ executables:
     other-modules:
       - Env
       - ZohoScraper
+      - SheetScraper
+

@@ -28,7 +28,6 @@ import Data.Either
 import Data.String.Conv
 
 spreadsheetIds =
-<<<<<<< HEAD
   [ ("Salcette", "spreadsheet_id_was_here")
   , ("Tiswadi", "spreadsheet_id_was_here")
   , ("Bardez", "spreadsheet_id_was_here")
@@ -45,13 +44,8 @@ spreadsheetIds =
   , ("GIDC", "spreadsheet_id_was_here")
   ]
 
-createEnv = do
-  creds <- fromFilePath "gauth.json"
-  mgr <- getGlobalManager
-  (allow (spreadsheetsScope ! driveFileScope)) <$> (newEnvWith creds noLogger mgr)
-
 createForms blockName = do
-  env <- createEnv
+  env <- createGoogleEnv
   let sprId = fromJust $ DL.lookup blockName spreadsheetIds
   waddoMapping <- runResourceT $ runGoogle env $ fetchVillageWaddoMapping sprId
   runApp $
@@ -89,13 +83,11 @@ createForms blockName = do
               sayLine $ "Duplicated: " <> formName
               pure $ Right x
 
-villageFormName blockName villageName = villageName <> " (" <> blockName <> ")"
-
 credsFor x = ("p" <> x <> "@covid.vacationlabs.com", "covid@" <> (T.takeEnd 4 x))
 
 createMissingUsers :: T.Text -> IO ()
 createMissingUsers blockName = do
-  env <- createEnv
+  env <- createGoogleEnv
   let sprId = fromJust $ DL.lookup blockName spreadsheetIds
   phones <-  runResourceT $ runGoogle env $ fetchAllPhones sprId
   runApp $ do
@@ -112,7 +104,7 @@ createMissingUsers blockName = do
   pure ()
 
 mapUsersToVillages blockName = do
-  env <- createEnv
+  env <- createGoogleEnv
   let sprId = fromJust $ DL.lookup blockName spreadsheetIds
   rows :: [[(Int, T.Text, [T.Text])]] <-  runResourceT $ runGoogle env $ fetchVillageUserMapping sprId
   runApp $  S.toList $
@@ -131,3 +123,4 @@ mapUsersToVillages blockName = do
           let allphones = DL.concatMap (^. _3) grp
               emails = DL.map (fst . credsFor) allphones
           shareForm flink emails
+

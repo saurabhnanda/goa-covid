@@ -18,14 +18,14 @@ import Data.List as DL
 import Data.Either
 import Data.Ord
 import Data.Text as T
+import Network.Google.Resource.Sheets.Spreadsheets.Values.Append
+import Env (sayLine)
 
 -- import Network.Google.Drive.Types
 
 type AppScopes =
   '["https://www.googleapis.com/auth/drive.file"]
 
-noLogger :: _ -> _ -> IO ()
-noLogger = const $ const $ pure ()
 
 withAppScopes x = allow (spreadsheetsScope ! driveFileScope) x
 
@@ -75,3 +75,13 @@ fetchVillageUserMapping sprId = do
       if T.strip x==""
       then []
       else [T.strip x]
+
+
+publishAccessCode username accessCode = do
+  let vrange = valueRange
+               & vrValues .~ [[Aeson.String username, Aeson.String accessCode]]
+      pload = (spreadsheetsValuesAppend "spreadsheet_id_was_here" vrange "Sheet1")
+              & svaValueInputOption ?~ "USER_ENTERED"
+              & svaInsertDataOption ?~ "INSERT_ROWS"
+  sayLine $ show vrange
+  send pload

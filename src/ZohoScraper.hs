@@ -30,8 +30,6 @@ import UnliftIO (liftIO, catch, SomeException)
 import Control.Monad.Catch (throwM, MonadThrow)
 import Control.Monad (void, forM_, forM, mapM)
 import Database.PostgreSQL.Simple
-import Database.PostgreSQL.Simple.FromField
-import Database.PostgreSQL.Simple.ToField
 import UnliftIO
 import Data.CaseInsensitive as CI(original)
 import qualified Data.List.Split as Split
@@ -42,6 +40,19 @@ import qualified Streamly as S
 import Data.Functor.Identity
 import GHC.Exts (fromList, toList)
 import Control.Monad.Reader (local)
+-- import qualified Data.Text.IO as T
+import qualified Data.ByteString.Char8 as C8
+import qualified Data.Char as Char
+import qualified SheetScraper as Sheet
+import qualified Network.Google as Google hiding (setBody)
+import Control.Monad.Reader (ask)
+import Debug.Trace
+import qualified Stats
+import Servant.HTML.Lucid
+import Lucid (Html(..), toHtmlRaw)
+import qualified Data.Text.IO as T
+import qualified System.Directory as Dir
+import Control.Concurrent.TokenBucket
 
 data InvitationEmail = InvitationEmail
   { invHtml :: !Text
@@ -57,11 +68,17 @@ instance FromMultipart Mem InvitationEmail where
 
 data Routes route = Routes
   { rInvitationEmailHandler :: route :- "invitationEmailHandler" :> MultipartForm Mem InvitationEmail :> (Post '[JSON] String)
+  , rStats :: route :- Get '[HTML] (Html ())
+  , rWaddoStats :: route :- "forms" :> Capture "formId" Int :> Get '[HTML] (Html ())
+  , rNavyStats :: route :- "navy" :> Get '[HTML] (Html ())
   } deriving (Generic)
 
 server :: Routes (AsServerT AppM)
 server = Routes
   { rInvitationEmailHandler = handleInivitationEmail
+  , rStats = stats
+  , rWaddoStats = waddoStats
+  , rNavyStats = navyStats
   }
 
 printInvitationLink inv@InvitationEmail{..} = (flip catch) errhandler $ do
@@ -85,7 +102,12 @@ handleInivitationEmail inv@InvitationEmail{..} = (flip catch) errhandler $ do
          sayLine $ "Success (" <> invTo <> ", " <> invSubject <> ")"
          pure "ok"
      | "Code" `T.isInfixOf` invSubject -> do
-         sayLine $ T.intercalate "\n" $ [invSubject, invHtml]
+         let accessCode = parseAccessCodeEmail invHtml
+         sayLine $ "Access code: " <> invTo <> " => " <> toS accessCode
+         googleEnv <- envGoogle <$> ask
+         Google.runResourceT $
+           Google.runGoogle googleEnv $
+           Sheet.publishAccessCode invTo accessCode
          pure "ok"
      | otherwise -> do
          sayLine $ "Ignored (" <> invTo <> ", " <> invSubject <> ")"
@@ -164,6 +186,14 @@ createUser email = do
       [ "emailaddresses" Aeson..= [ email ]
       ]
 
+
+parseAccessCodeEmail :: Text -> Text
+parseAccessCodeEmail email =
+  -- email <-  BS.readFile "access_code.html"
+  let tags = parseTags email
+  in fromTagText $ DL.head $ DL.filter (tagText isCode) tags
+  where
+    isCode x = DL.all Char.isDigit $ (toS x :: String)
 
 parseInvitationEmail :: Text -> Text
 parseInvitationEmail email = do
@@ -291,11 +321,6 @@ data SheetRow = SheetRow
   , rowDivision :: !Text -- district / taluka name
   } deriving (Eq, Show)
 
-newtype FormLinkName = FormLinkName {unFormLinkName :: Text} deriving (Eq, Show, Generic, FromField, ToField)
-newtype FormId = FormId {unFormId :: Int} deriving (Eq, Show, Generic, FromField, ToField)
-newtype UserId = UserId {unUserId :: Int} deriving (Eq, Show, Generic, FromField, ToField)
-newtype ZohoUserId = ZohoUserId {unZohoUserId :: Text} deriving (Eq, Show, Generic, FromField, ToField)
-newtype ZohoFormId = ZohoFormId {unZohoFormId :: Text} deriving (Eq, Show, Generic, FromField, ToField)
 
 data AppErr = ErrFormNotFound
             | ErrUserNotFound
@@ -587,6 +612,11 @@ fetchKnownFormByName :: Text -> AppM (Maybe (Int, ZohoFormId, FormLinkName, Text
 fetchKnownFormByName fname = withDb $ \conn -> do
   listToMaybe <$> (liftIO $ query conn "select id, zoho_form_id, link_name, form_name from forms where form_name=?" (Only fname))
 
+
+fetchKnownFormById :: Int -> AppM (Maybe (Int, ZohoFormId, FormLinkName, Text))
+fetchKnownFormById fid = withDb $ \conn -> do
+  listToMaybe <$> (liftIO $ query conn "select id, zoho_form_id, link_name, form_name from forms where id=?" (Only fid))
+
 changeWaddoNames :: FormLinkName -> [Text] -> AppM _
 changeWaddoNames flink waddoNames = do
   f <- fetchForm flink
@@ -614,3 +644,294 @@ changeWaddoNames flink waddoNames = do
           withoutKeys = Aeson.Object $ f ^. _Object & sans ("enc_scheduled_status") . (sans "save_button_label") . (sans "show_save_button")
           newForm = withoutKeys & (key "pages") . (key "page") . (nth 0) . key ("fields") .~ (Aeson.toJSON newFields)
       in Aeson.object [ "form" Aeson..= newForm ]
+
+
+createReport :: FormLinkName -> Text -> AppM _
+createReport flink displayName = do
+  req <- parseRequest "https://forms.zoho.com/GoaCovidSurvey/reports"
+  res <- makePost $
+         setBody (Aeson.encode pload) $
+         addHeaders [ajaxHeader] $
+         req
+  if responseStatus res == created201
+    then do sayLine $ "REPORT CREATED: " <> displayName
+            let reportLink = (fromJust $ (responseBody res) ^? (key "report") . (key "link_name") . _String)
+                reportZohoId = show $ (fromJust $ (responseBody res) ^? (key "report") . (key "report_id") . _Integer)
+            void $ updateDb reportLink reportZohoId
+            pure Nothing
+    else pure $ Just (flink, res)
+  where
+    updateDb reportLink reportZohoId = withDb $ \conn -> do
+      liftIO $ execute conn "insert into reports (link_name, display_name, form_link_name, zoho_report_id) values(?, ?, ?, ?)" (reportLink, displayName, flink, reportZohoId)
+    pload = Aeson.object
+      [ "report" Aeson..= Aeson.object
+        [ "display_name" Aeson..= displayName
+        , "related_form" Aeson..= (unFormLinkName flink)
+        ]
+      ]
+
+
+fetchKnownForms :: AppM [(Int, ZohoFormId, FormLinkName, Text)]
+fetchKnownForms = withDb $ \conn -> do
+  liftIO $ query_ conn "select id, zoho_form_id, link_name, form_name from forms"
+
+fetchKnownReports :: AppM [(ReportLinkName, Text)]
+fetchKnownReports = withDb $ \conn -> do
+  liftIO $ query_ conn "select link_name, display_name from reports"
+
+createAllReports :: AppM _
+createAllReports = local (\r -> r{envBurstSize = 3, envInvRate = round (1e6 / 0.08)}) $ do
+  pendingReports <- fetchPendingReports
+  S.toList $
+    S.maxThreads 10 $
+    S.asyncly $
+    S.mapMaybeM (\(flink, fname) -> createReport flink fname) $
+    S.fromList $
+    pendingReports
+  where
+    fetchPendingReports = withDb $ \conn -> do
+      liftIO $ query_ conn "select link_name, form_name from forms f where not exists (select 1 from reports r where r.form_link_name=f.link_name)"
+
+
+fetchReportCounts :: AppM _
+fetchReportCounts = local (\r -> r{envBurstSize = 3, envInvRate = round (1e6 / 0.08)}) $ do
+  knownReports <- fetchKnownReports
+  S.toList $
+    S.maxThreads 10 $
+    S.asyncly $
+    S.mapMaybeM go $
+    S.fromList knownReports
+  where
+    go (rlink, displayName) = do
+      req <- parseRequest $
+             "https://forms.zoho.com/GoaCovidSurvey/report/" <> (toS $ unReportLinkName rlink) <> "/records?start=1&pageSize=10"
+      res <- makeGet $
+             addHeaders [(hAccept, "application/json"), ajaxHeader] $
+             req
+      if responseStatus res /= ok200
+        then pure $ Just (rlink, res)
+        else do let cnt = (fromJust $ (responseBody res) ^? (key "report") . (key "total_records") . _Integer)
+                sayLine $ "TOTAL RECORDS - " <> displayName <> " - " <> (toS $ show cnt)
+                updateDb rlink cnt
+                pure Nothing
+    updateDb rlink cnt = withDb $ \conn -> do
+      liftIO $ execute conn "update reports set total_records = ? where link_name = ?" (cnt, rlink)
+
+
+fetchWaddoCounts :: FormLinkName -> [Text] -> AppM _
+fetchWaddoCounts flink waddoNames = local (\r -> r{envBurstSize = 3, envInvRate = round (1e6 / 1)}) $ do
+  S.toList $
+    S.maxThreads 5 $
+    S.asyncly $
+    S.mapMaybeM go $
+    S.fromList waddoNames
+  where
+    go waddoName = do
+      req <- parseRequest $
+             "https://forms.zoho.com/GoaCovidSurvey/report/" <> (toS $ unFormLinkName flink) <> "_Report/records"
+      res <- retryOnTemporaryNetworkErrors $ makePost $
+             setBody (Aeson.encode $ pload waddoName) $
+             addHeaders [(hAccept, "application/json"), ajaxHeader, (hContentType, "application/json")] $
+             req
+      if responseStatus res /= ok200
+        then pure $ Just (flink, res)
+        else do let cnt = (fromJust $ (responseBody res) ^? (key "report") . (key "total_records") . _Integer)
+                sayLine $ "WADDO COUNT - " <> waddoName <> " - " <> (toS $ show cnt)
+                updateDb waddoName cnt
+                pure Nothing
+    pload waddoName = Aeson.object
+      [ "entries" Aeson..= Aeson.object
+        [ "criteria" Aeson..= Aeson.object
+          [ "filter" Aeson..= Aeson.object
+            [ "Dropdown" Aeson..= Aeson.object
+              [ "operator" Aeson..= ("EQUALS" :: Text)
+              , "value" Aeson..= waddoName
+              ]
+            ]
+          ]
+        ]
+      ]
+    updateDb waddoName cnt = withDb $ \conn -> do
+      liftIO $ execute conn "update waddos set record_count = ? where form_link_name=? and waddo_name=?" (cnt, flink, waddoName)
+
+
+--
+fetchEntryCounts :: Bool -> AppM _
+fetchEntryCounts flag = local (\r -> r{envBurstSize = 3, envInvRate = round (1e6/2)}) $ do
+  knownForms <- fetchKnownForms
+  S.toList $
+    S.asyncly $
+    S.concatMapM go2 $
+    S.maxThreads 5 $
+    S.asyncly $
+    S.mapM go $
+    S.fromList $
+    DL.reverse $
+    knownForms
+  where
+    go2 result = case result of
+      Left e -> pure $ S.fromList [e]
+      Right (_, flink, waddoNames) ->
+        case flag of
+          True -> S.fromList <$> (fetchWaddoCounts flink waddoNames)
+          False -> pure $ S.fromList []
+    go (_, _, rlink, displayName) = do
+      req <- parseRequest $
+             "https://forms.zoho.com/GoaCovidSurvey/report/" <> (toS $ unFormLinkName rlink) <> "_Report/records?start=1&pageSize=10"
+      res <- retryOnTemporaryNetworkErrors $ makeGet $
+             addHeaders [(hAccept, "application/json"), ajaxHeader] $
+             req
+      if responseStatus res /= ok200
+        then pure $ Left (rlink, res)
+        else do let cnt = (fromJust $ (responseBody res) ^? (key "report") . (key "total_records") . _Integer)
+                    waddoNames = (responseBody res) ^.. (key "report") . (key "fields") . (key "0") . (key "choices") . values . (key "value") . _String
+                sayLine $ "TOTAL RECORDS - " <> displayName <> " - " <> (toS $ show cnt)
+                updateDb rlink waddoNames cnt
+                pure $ Right (displayName, rlink, waddoNames)
+    updateDb flink waddoNames cnt = withDb $ \conn -> do
+      liftIO $ do
+        execute conn "update forms set total_records = ? where link_name = ?" (cnt, flink)
+        forM_ waddoNames $ \waddoName -> do
+          (query conn "select id from waddos where waddo_name = ? and form_link_name = ?" (waddoName, flink)) >>= \case
+            [] -> void $ execute conn "insert into waddos(form_link_name, waddo_name) values(?, ?)" (flink, waddoName)
+            [_ :: Only Int] -> pure ()
+
+
+-- statsHelper :: AppM _
+statsHelper rows = (flip catch) errhandler $ do
+  lastUpdated <- liftIO $ T.readFile "last-updated"
+  let total = DL.sum $ DL.map (^. _2) rows
+      blockGroups = DL.sortOn (^. _1) $
+                    DL.map withBlockTotals $
+                    DL.groupBy (\x y -> x ^. _2 == y ^. _2) $
+                    DL.sortOn (^. _2) $
+                    DL.map splitName rows
+  pure $ Stats.page lastUpdated blockGroups total
+  where
+    splitName :: (Text, Int, FormId) -> (Text, Text, Int, FormId)
+    splitName (x, cnt, zid) =
+      case T.split (\x -> x=='(' || x==')') x of
+        formName:blockName:_ -> (T.strip formName, blockName, cnt, zid)
+        _ -> (x, "Unknown block", cnt, zid)
+
+    withBlockTotals :: [(Text, Text, Int, FormId)] -> (Text, Int, [(Text, Int, FormId)])
+    withBlockTotals grp =
+      let blockName = (DL.head grp) ^. _2
+          blockTotal = DL.sum $ DL.map (^. _3) grp
+          rows = DL.map (\(formName, blockName, cnt, zid) -> (formName, cnt, zid)) grp
+      in (blockName, blockTotal, DL.sortOn (^. _1) rows)
+
+    errhandler (e::SomeException) = pure $ toHtmlRaw $ show e
+
+
+stats :: AppM _ -- [(Text, Int, [(Text, Int)])]
+stats = do
+  fetchStats >>= statsHelper
+  where
+    fetchStats :: AppM [(Text, Int, FormId)]
+    fetchStats = withDb $ \conn -> do
+      liftIO $ query_ conn "select form_name, total_records, id from forms where form_name not ilike '%naval%' order by reverse(form_name)"
+
+navyStats = do
+  fetchStats >>= statsHelper
+  where
+    fetchStats :: AppM [(Text, Int, FormId)]
+    fetchStats = withDb $ \conn -> do
+      liftIO $ query_ conn "select form_name, total_records, id from forms where form_name ilike '%naval%' order by reverse(form_name)"
+
+waddoStats :: Int -> AppM _ -- [(Text, Int, [(Text, Int)])]
+waddoStats formId = do
+  rows <- fetchStats
+  form <- fromJust <$> (fetchKnownFormById formId)
+  lastUpdated <- liftIO $ T.readFile "last-updated"
+  let total = DL.sum $ DL.map snd rows
+  pure $ Stats.waddoPage lastUpdated form total rows
+  where
+    fetchStats :: AppM [(Text, Int)]
+    fetchStats = withDb $ \conn -> do
+      liftIO $ query conn "select w.waddo_name, w.record_count from waddos w, forms f where f.link_name=w.form_link_name and f.id=? order by w.record_count" (Only formId)
+
+
+deactivateAllUsers :: AppM _
+deactivateAllUsers = local (\r -> r{envBurstSize = 10, envInvRate = round (1e6/3)}) $ do
+  zohoUserIds <- fetchUsers
+  S.toList $
+    S.maxThreads 10 $
+    S.asyncly $
+    S.mapMaybeM deactivateUser $
+    S.fromList $
+    -- DL.take 10
+    zohoUserIds
+  where
+    fetchUsers = withDb $ \conn -> do
+      liftIO $ query_ conn "select u.username, zoho_user_id, f.link_name from users u left join users_forms f on u.username=f.username where u.zoho_user_id is not null and  ((f.link_name is null) or (f.link_name not ilike '%navalbase')) and u.is_inactive=false"
+
+
+deactivateUser :: (Text, ZohoUserId, Maybe FormLinkName) -> AppM _
+deactivateUser (email, zuid, flink) = do
+  req <- parseRequest $ "https://forms.zoho.com/GoaCovidSurvey/user/" <> toS (unZohoUserId zuid) <> "/status"
+  res <- retryOnTemporaryNetworkErrors $ makePost $
+         setBody (Aeson.encode pload) $
+         addHeaders [ajaxHeader] $
+         req
+  if | (responseStatus res) == ok200 -> do
+         void updateDb
+         sayLine $ "Deactivated " <> email <> " having access to " <> (maybe "no forms" unFormLinkName flink)
+         pure Nothing
+     | (responseStatus res) == status400 ->
+         if (responseBody res) ^? (key "error") . _String == Just "This user is already inactive."
+         then do sayLine $ "Already deactivated " <> email
+                 pure Nothing
+         else pure $ Just (email, res)
+     | otherwise -> pure $ Just (email, res)
+  where
+    pload = Aeson.object
+      [ "status" Aeson..= ("inactive" :: Text) ]
+    updateDb = withDb $ \conn -> do
+      liftIO $ execute conn "update users set is_inactive=true where zoho_user_id=?" (Only zuid)
+
+
+downloadAllCsvReports :: FilePath -> IO  _
+downloadAllCsvReports outDir = do
+  linkNames <- ((DL.map T.strip) . T.lines) <$> (T.readFile "report-link-names.txt")
+  tb <- newTokenBucket
+  S.drain $
+    S.asyncly $
+    S.maxThreads threadCount $
+    S.mapM (go tb) $
+    S.fromList linkNames
+  pure ()
+  where
+    threadCount = 5 :: Int
+    go tb flink = do
+      let outFile = (outDir <> "/" <> (toS flink) <> ".csv")
+      (Dir.doesFileExist outFile) >>= \case
+        True -> sayLine $ "Already exists " <> outFile
+        False -> do
+          tokenBucketWait tb 2 (round $ 1e6/0.08)
+          (downloadCsvReport (FormLinkName flink) outFile) >>= \case
+            Left (e :: SomeException) -> sayLine $ "Error in downloading " <> flink <> ": " <> (toS $ show e)
+            Right _ -> pure ()
+
+
+downloadCsvReport :: FormLinkName -> FilePath -> _
+downloadCsvReport flink outFile = do
+  req <- parseRequest $ "https://forms.zoho.com/exportdata?portalname=GoaCovidSurvey&reportlinkname=" <>
+         (toS $ unFormLinkName flink) <> "_Report&exporttype=csv&filename=" <> (toS $ unFormLinkName flink) <> ".csv"
+  mgr <- getGlobalManager
+  let finalReq = addHeaders [ajaxHeader] $
+                 withHeaders req
+  try $ withResponse finalReq mgr $ \breaderRes -> do
+    Dir.removePathForcibly outFile
+    S.drain $
+      S.trace writeChunk $
+      S.unfoldrM getNextChunk (responseBody breaderRes)
+  where
+    getNextChunk breader = do
+      responseChunk <- brRead breader
+      if responseChunk == mempty
+        then do sayLine $ "Written " <> unFormLinkName flink
+                pure Nothing
+        else pure $ Just (responseChunk, breader)
+    writeChunk responseChunk = do
+      BS.appendFile outFile responseChunk
