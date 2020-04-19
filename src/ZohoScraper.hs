@@ -41,6 +41,7 @@ import qualified Streamly.Prelude as S
 import qualified Streamly as S
 import Data.Functor.Identity
 import GHC.Exts (fromList, toList)
+import Control.Monad.Reader (local)
 
 data InvitationEmail = InvitationEmail
   { invHtml :: !Text
@@ -330,9 +331,9 @@ fetchZohoUserIds = do
 
 
 changeRolesForUsers :: AppM _
-changeRolesForUsers = do
+changeRolesForUsers = local (\r -> r{envBurstSize = 50, envInvRate = round (1e6 / 8)}) $ do
   zuids :: [(Only ZohoUserId)] <- getZohoUserIds
-  results <- S.toList $ S.maxThreads 30 $ S.asyncly $
+  results <- S.toList $ S.maxThreads 50 $ S.asyncly $
              S.filter isInterestingError $
              (flip S.mapMaybeM) (S.fromList zuids) $ \(Only zuid) -> do
     eRes :: (Either SomeException (Response BSL.ByteString)) <- try $ do
@@ -376,7 +377,7 @@ changeRolesForUsers = do
 shareForm :: FormLinkName -> [Text] -> AppM _
 shareForm flink emails = do
   existingEmails <- fetchExistingEmails
-  let finalEmails = (DL.\\) emails existingEmails
+  let finalEmails = (DL.\\) (DL.nub emails) existingEmails
   req <- mkFormRequest flink $ Just "share/private/users"
   S.toList $
     S.maxThreads 5 $
@@ -396,7 +397,7 @@ shareForm flink emails = do
       if (responseStatus res) == ok200
         then do updateDb es
                 pure Nothing
-        else pure $ Just $ responseBody res
+        else pure $ Just $ (es, responseBody res)
 
     fetchExistingEmails = withDb $ \conn -> do
       liftIO $ DL.map (\(Only x) -> x) <$>

@@ -14,10 +14,13 @@ import Control.Retry as Retry
 import Control.Monad.Catch as E (MonadMask, Handler(..))
 import Control.Concurrent.TokenBucket
 import qualified Data.ByteString as BS
+import GHC.Word
 
 data Env = Env
   { envDbPool :: Pool Connection
   , envTokenBucket :: !TokenBucket
+  , envBurstSize :: !Word64
+  , envInvRate :: !Word64
   }
 
 type AppM = ReaderT Env IO
@@ -33,14 +36,16 @@ withDb action = do
 
 withRateLimiting :: AppM a -> AppM a
 withRateLimiting action = do
-  tb <- envTokenBucket <$> ask
-  liftIO $ tokenBucketWait tb 10 $ round (1e6 / 0.6667)
+  Env{..} <- ask
+  liftIO $ tokenBucketWait envTokenBucket envBurstSize envInvRate
   action
 
 withEnv :: (Env -> IO a) -> IO a
 withEnv action = do
   withPool $ \envDbPool -> do
     envTokenBucket <- newTokenBucket
+    let envBurstSize = 10
+        envInvRate = round (1e6 / 0.6667)
     action Env{..}
 
 runApp :: AppM a -> IO a

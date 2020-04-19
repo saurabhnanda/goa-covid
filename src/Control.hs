@@ -28,6 +28,7 @@ import Data.Either
 import Data.String.Conv
 
 spreadsheetIds =
+<<<<<<< HEAD
   [ ("Salcette", "spreadsheet_id_was_here")
   , ("Tiswadi", "spreadsheet_id_was_here")
   , ("Bardez", "spreadsheet_id_was_here")
@@ -40,6 +41,8 @@ spreadsheetIds =
   , ("Quepem", "spreadsheet_id_was_here")
   , ("Sanguem", "spreadsheet_id_was_here")
   , ("Canacona", "spreadsheet_id_was_here")
+  , ("Panjim", "spreadsheet_id_was_here")
+  , ("GIDC", "spreadsheet_id_was_here")
   ]
 
 createEnv = do
@@ -123,7 +126,7 @@ mapUsersToVillages blockName = do
     go grp = do
       let (_, villageName, _) = (DL.head grp)
       (fetchKnownFormByName (villageFormName blockName villageName)) >>= \case
-        Nothing -> pure ["Unknown form " <> toS villageName]
+        Nothing -> pure [([], "Unknown form " <> toS villageName)]
         Just (_, _, flink, _) -> do
           let allphones = DL.concatMap (^. _3) grp
               emails = DL.map (fst . credsFor) allphones
