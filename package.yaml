@@ -74,6 +74,10 @@ dependencies:
   - servant-multipart
   - concurrent-output
   - exceptions
+  - postgresql-simple
+  - resource-pool
+  - case-insensitive
+  - split
 
 executables:
   goa-covid:
