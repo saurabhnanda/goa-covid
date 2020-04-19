@@ -1,0 +1,12 @@
+{
+  "type": "service_account",
+  "project_id": "removed",
+  "private_key_id": "REMOVED",
+  "private_key": "REMOVED",
+  "client_email": "removed@removed.iam.gserviceaccount.com",
+  "client_id": "removed",
+  "auth_uri": "removed",
+  "token_uri": "removed",
+  "auth_provider_x509_cert_url": "removed",
+  "client_x509_cert_url": "removed"
+}

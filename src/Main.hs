@@ -25,10 +25,9 @@ routesProxy :: Proxy Routes
 routesProxy = Proxy
 
 startApp :: IO ()
-startApp = withConcurrentOutput $ do
-  withPool $ \envDbPool -> do
+startApp = withConcurrentOutput $ withEnv $ \env -> do
     let appToHandler :: AppM a -> Handler a
-        appToHandler action = liftIO $ runReaderT action Env{..}
+        appToHandler action = liftIO $ runReaderT action env
     putStrLn "Starting app..."
     run 8000 $
       serve routesProxy $

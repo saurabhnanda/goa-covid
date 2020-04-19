@@ -6,7 +6,7 @@ import Data.Text as T
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as BSL
 import Network.HTTP.Client
-import Network.HTTP.Types
+import Network.HTTP.Types as HT
 import Network.HTTP.Client.TLS
 import Data.Aeson as Aeson
 import Text.HTML.TagSoup
@@ -27,7 +27,7 @@ import Env
 import Servant.Multipart
 import Data.Text (Text)
 import UnliftIO (liftIO, catch, SomeException)
-import Control.Monad.Catch (throwM)
+import Control.Monad.Catch (throwM, MonadThrow)
 import Control.Monad (void, forM_, forM, mapM)
 import Database.PostgreSQL.Simple
 import Database.PostgreSQL.Simple.FromField
@@ -35,6 +35,12 @@ import Database.PostgreSQL.Simple.ToField
 import UnliftIO
 import Data.CaseInsensitive as CI(original)
 import qualified Data.List.Split as Split
+import Control.Lens
+import Data.Aeson.Lens
+import qualified Streamly.Prelude as S
+import qualified Streamly as S
+import Data.Functor.Identity
+import GHC.Exts (fromList, toList)
 
 data InvitationEmail = InvitationEmail
   { invHtml :: !Text
@@ -122,16 +128,26 @@ addHeaders h req = req { requestHeaders = (requestHeaders req) <> h }
 setMethod :: Method -> Request -> Request
 setMethod m req = req { method = m }
 
-makePost :: Request -> IO _
-makePost req = do
+makePost :: (MonadIO m) => Request -> m _
+makePost req = liftIO $ do
   mgr <- getGlobalManager
   (flip httpLbs) mgr $
     setMethod "POST" $
     withHeaders $
     req
 
-makeGet :: Request -> IO _
-makeGet req = do
+makePut :: (MonadIO m) => BSL.ByteString -> Request -> m _
+makePut pload req = liftIO $ do
+  mgr <- getGlobalManager
+  (flip httpLbs) mgr $
+    setMethod "PUT" $
+    setBody pload $
+    withHeaders $
+    req
+
+
+makeGet :: MonadIO m => Request -> m _
+makeGet req = liftIO $ do
   mgr <- getGlobalManager
   (flip httpLbs) mgr $
     setMethod "GET" $
@@ -205,7 +221,7 @@ submitSignupForm InvitationEmail{..} u cj = do
 
     fetchPassword = withDb $ \conn -> do
       r <- (liftIO $ query conn "SELECT password from users where username = ?" (Only invTo))
-      case r of 
+      case r of
         [(Only password) :: Only Text] -> pure password
         _ -> Prelude.error "sql error"
 
@@ -251,15 +267,6 @@ fetchUserList = do
     Left e -> Prelude.error e
     Right r -> pure $ unUserList r
 
-shareForm :: Text -> [Text] -> IO ()
-shareForm formId emails = do
-  users <- fetchUserList
-  req <- parseRequest $ "https://forms.zoho.com/REMOVED/form/" <> toS formId <> "/share/private/users"
-  void $ makePost $ setBody (Aeson.encode pload) req
-  where
-    pload = Aeson.object [ "emailids" Aeson..= emails ]
-
-
 users :: [(Text, Text)]
 users =
   [ ("9123456789", "REMOVED")
@@ -283,8 +290,12 @@ data SheetRow = SheetRow
   , rowDivision :: !Text -- district / taluka name
   } deriving (Eq, Show)
 
-newtype FormId = FormId Int deriving (Eq, Show, Generic, FromField, ToField)
-newtype UserId = UserId Int deriving (Eq, Show, Generic, FromField, ToField)
+newtype FormLinkName = FormLinkName {unFormLinkName :: Text} deriving (Eq, Show, Generic, FromField, ToField)
+newtype FormId = FormId {unFormId :: Int} deriving (Eq, Show, Generic, FromField, ToField)
+newtype UserId = UserId {unUserId :: Int} deriving (Eq, Show, Generic, FromField, ToField)
+newtype ZohoUserId = ZohoUserId {unZohoUserId :: Text} deriving (Eq, Show, Generic, FromField, ToField)
+newtype ZohoFormId = ZohoFormId {unZohoFormId :: Text} deriving (Eq, Show, Generic, FromField, ToField)
+
 data AppErr = ErrFormNotFound
             | ErrUserNotFound
             deriving (Eq, Show)
@@ -317,31 +328,94 @@ fetchZohoUserIds = do
     getUserIds = withDb $ \conn -> do
       liftIO $ query_ conn "select id, username from users where zoho_user_id is null"
 
-changeRolesForUsers :: [Text] -> AppM _
-changeRolesForUsers conn = do
-  zuids <- getUserIds
-  forM zuids $ \ zuid -> liftIO $ do
-    req <- parseRequest $ "https://forms.zoho.com/REMOVED/user/" <> zuid <> "/role"
-    makePost $ setBody (Aeson.encode pload) req
+
+changeRolesForUsers :: AppM _
+changeRolesForUsers = do
+  zuids :: [(Only ZohoUserId)] <- getZohoUserIds
+  results <- S.toList $ S.maxThreads 30 $ S.asyncly $
+             S.filter isInterestingError $
+             (flip S.mapMaybeM) (S.fromList zuids) $ \(Only zuid) -> do
+    eRes :: (Either SomeException (Response BSL.ByteString)) <- try $ do
+      sayLine $ "trying " <> unZohoUserId zuid
+      req <- parseRequest $ "https://forms.zoho.com/REMOVED/user/" <> toS (unZohoUserId zuid) <> "/role"
+      retryOnTemporaryNetworkErrors $ makePost $ setBody (Aeson.encode pload) req
+    case eRes of
+      Left e -> pure $ Just $ toS $ show e
+      Right res -> do
+        if | ok200 == responseStatus res -> do
+               updateFlag zuid
+               pure Nothing
+           | status400 == responseStatus res -> do
+               case eitherDecode (responseBody res) of
+                 Left e -> pure $ Just $ "Error in decoding response " <> (toS $ show e)
+                 Right (v :: Aeson.Value) ->
+                   case v ^? (key "error") . _String of
+                     Nothing -> pure $ Just "unknown error"
+                     Just e ->
+                       if | "already assigned" `T.isInfixOf` e -> do
+                              updateFlag zuid
+                              pure Nothing
+                          | otherwise -> pure $ Just e
+           | otherwise -> do
+               pure $ Just $ toS $ responseBody res
+  pure results
   where
-    getUserIds = withDb $ \conn -> do
-      liftIO $ query_ conn "select zoho_user_id from users where not is_respondent limit 10"
+    isInterestingError e = True
+      -- case e of
+      --   Nothing -> False
+      --   Just x -> Prelude.not (("transfer" `T.isInfixOf` x) || ("not accessed" `T.isInfixOf` x))
+
+    getZohoUserIds = withDb $ \conn -> do
+      liftIO $ query_ conn "select zoho_user_id from users where zoho_user_id is not null and not is_respondent"
 
     pload = Aeson.object [ "role" Aeson..= ("respondent" :: Text)]
 
-    udpateFlag zuid = withDb $ \conn -> do
-      liftIO $ void $ execute conn "update users set is_respondent=true where zoho_user_id=? in (?)" (Only zuid)
+    updateFlag zuid = withDb $ \conn -> do
+      liftIO $ void $ execute conn "update users set is_respondent=true where zoho_user_id=?" (Only zuid)
 
--- shareFormsToUsers :: Connection -> FormId -> IO ()
--- shareFormsToUsers conn fid = do
+shareForm :: FormLinkName -> [Text] -> AppM _
+shareForm flink emails = do
+  existingEmails <- fetchExistingEmails
+  let finalEmails = (DL.\\) emails existingEmails
+  req <- mkFormRequest flink $ Just "share/private/users"
+  S.toList $
+    S.maxThreads 5 $
+    S.asyncly $
+    S.mapMaybeM (go req) $
+    S.fromList $
+    Split.chunksOf 20 $
+    finalEmails
+  where
+    go req es = do
+      res <- retryOnTemporaryNetworkErrors $
+             makePost $
+             setBody (Aeson.encode $ Aeson.object [ "emailids" Aeson..= es ]) $
+             addHeaders [ajaxHeader] $
+             req
+
+      if (responseStatus res) == ok200
+        then do updateDb es
+                pure Nothing
+        else pure $ Just res
+
+    fetchExistingEmails = withDb $ \conn -> do
+      liftIO $ DL.map (\(Only x) -> x) <$>
+        (query conn "select username from users_forms where link_name = ?" (Only flink))
+        -- (query conn "select u.username from users_forms uf, users u, forms f where uf.user_id = u.id and uf.form_id=f.id and f.link_name=? and u.username in ?" (flink, In emails))
+    updateDb es = withDb $ \conn -> liftIO $ do
+      forM_ es $ \e -> do
+        execute conn "insert into users_forms(username, link_name) values(?, ?)" (e, flink)
+      -- liftIO $ execute conn "insert into users_forms(form_id, user_id) select f.id, u.id from forms f, users u where f.link_name=? and u.username in ?" (flink, In es)
+
+
+-- shareFormsToUsers :: FormLinkName -> [Text] -> AppM ()
+-- shareFormsToUsers formName = do
 --   linkName <- getFormLink
---   users :: [(UserId, Text)] <- getUsers
+--   users :: [(ZohoUserId, Text)] <- getUsers
 --   forM_ (Split.chunksOf 20 users) $ \us -> do
 --     shareForm fid $ DL.map snd us
 --     updateFlag $ DL.map fst us
 --   where
---     updateFlag us = do
---       void $ execute conn "update users_forms set is_shared=true where user_id in (?)" (Only (In us))
 
 --     getFormLink = do
 --       (query conn "select link_name from forms where id = ? and not is_shared" fid) >>= \case
@@ -353,12 +427,12 @@ changeRolesForUsers conn = do
 
 -- shareForm :: FormId -> [Text] -> IO ()
 -- shareForm formId emails = do
---   req <- parseRequest $ "https://forms.zoho.com/REMOVED/form/" <> toS formId <> "/share/private/users"
+--   req <- parseRequest $ "https://forms.zoho.com/REMOVED/form/" <> show (unFormId formId) <> "/share/private/users"
 --   void $ makePost $ setBody (Aeson.encode pload) req
 --   where
 --     pload = Aeson.object [ "emailids" Aeson..= emails ]
 
--- storeUserMappingInDb :: Connection -> SheetRow -> IO (UserId, FormId)
+-- storeUserMappingInDb :: Connection -> SheetRow -> IO (ZohoUserId, FormId)
 -- storeUserMappingInDb conn row@SheetRow{..} = do
 --   (formIdForSheetRow row) >>= \case
 --     Nothing -> pure $ Left ErrFormNotFound
@@ -371,3 +445,171 @@ changeRolesForUsers conn = do
 --             then void $ execute conn "insert into users_forms(user_id, form_id) values (?, ?) " (uid, fid)
 --             else pure ()
 --           pure (uid, fid)
+
+
+-- createZohoUsersWhereMissed :: AppM _
+-- createZohoUsersWhereMissed = withDb $ \conn -> do
+--   rows :: [Only Text] <- liftIO $ query_ conn "select username from users where zoho_user_id is null"
+--   forM rows createUser
+
+superAdminUserId :: ZohoUserId
+superAdminUserId = ZohoUserId "489260000000002001"
+
+-- baseFormId :: ZohoFormId
+-- baseFormId = ZohoFormId "489260000000017190"
+
+baseFormLink :: FormLinkName
+baseFormLink = FormLinkName "ToBeDuplicated"
+
+
+mkFormRequest :: (MonadThrow m) => FormLinkName -> Maybe Text -> m _
+mkFormRequest (FormLinkName fname) mfragment =
+  let f = maybe fname (\x -> fname <> "/" <> x) mfragment
+  in parseRequest $ "https://forms.zoho.com/REMOVED/form/" <> toS f
+
+ajaxHeader :: HT.Header
+ajaxHeader = ("X-Requested-With", "XMLHttpRequest")
+
+fetchForm :: FormLinkName -> AppM Value
+fetchForm fname = do
+  req <- mkFormRequest fname Nothing
+  res <- retryOnTemporaryNetworkErrors $
+         makeGet $
+         addHeaders [ (hAccept, "application/zoho.forms.medium-v1+pageJson")
+                    , ajaxHeader
+                    ] $
+         req
+  if (responseStatus res) /= ok200
+    then Prelude.error $ show res
+    else pure $ fromJust $ (responseBody res) ^? (key "form")
+
+
+changeFormOwnership :: FormLinkName -> ZohoUserId -> IO _
+changeFormOwnership fname zuid = do
+  req <- mkFormRequest fname (Just "admin")
+  makePut (Aeson.encode pload) $
+    addHeaders [ ajaxHeader, (hContentType, "application/json")] $
+    req
+  where
+    pload = Aeson.object [ "user_id" Aeson..= (unZohoUserId zuid) ]
+
+
+fetchAllForms :: IO _
+fetchAllForms = do
+  req <- parseRequest "https://forms.zoho.com/REMOVED/forms"
+  res <- makeGet $ addHeaders [ajaxHeader, (hAccept, "zohoforms/small+json")] $ req
+  pure $ (responseBody res) ^.. (key "forms") . (key "form") . values
+
+changeOwnershipOfAllForms :: IO _
+changeOwnershipOfAllForms = do
+  fs <- fetchAllForms
+  S.toList $
+    S.maxThreads 20 $
+    S.asyncly $
+    S.mapMaybeM go $
+    S.fromList $
+    fs
+  where
+    go :: Value -> IO _
+    go f = do
+      case f ^? (key "link_name") . _String of
+        Nothing -> Prelude.error $ "form without link name " <> show f
+        Just l -> do
+          sayLine l
+          res <- changeFormOwnership (FormLinkName l) superAdminUserId
+          if (responseStatus res == ok200)
+            then pure Nothing
+            else case (fmap (T.isInfixOf "current form owner as the new owner") $ (responseBody res) ^? (key "error") . _String) of
+                   Just True -> pure Nothing
+                   _ -> pure $ Just (l, responseStatus res, responseBody res)
+
+deleteAllUnknownForms :: AppM _
+deleteAllUnknownForms = do
+  fs <- liftIO $ fetchAllForms
+  S.toList $
+    S.maxThreads 20 $
+    S.asyncly $
+    S.mapMaybeM (liftIO . deleteForm) $
+    S.mapMaybeM go $
+    S.fromList fs
+  where
+    go :: Value -> AppM (Maybe FormLinkName)
+    go f = do
+      case f ^? (key "link_name") . _String  of
+        Nothing -> Prelude.error $ "form without link " <> show f
+        Just flink ->
+          if flink == unFormLinkName baseFormLink || flink == "Part1RibandarforTraining1" || flink == "TaleigaoForTraining"
+          then do sayLine $ "SKIPPING " <> flink
+                  pure Nothing
+          else do
+            (withDb $ \conn -> liftIO $ query @_ @(Only Int) conn "select id from forms where link_name=?" (Only flink)) >>= \case
+              [] -> do
+                sayLine $ "to be deleted " <> flink <> " - " <> (fromMaybe ""  $ f ^? (key "display_name") . _String)
+                pure $ Just $ FormLinkName flink
+              _ -> pure Nothing
+
+
+deleteForm :: FormLinkName -> IO _
+deleteForm flink = do
+  req <- mkFormRequest flink (Just "trash")
+  res <- makePost $
+         addHeaders [ajaxHeader] req
+  if responseStatus res == ok200
+    then pure $ Nothing
+    else pure $ Just res
+
+
+duplicateForm :: Text -> AppM (Either _ (Int, ZohoFormId, FormLinkName, Text))
+duplicateForm fname = do
+  req <- liftIO $ mkFormRequest baseFormLink Nothing
+  res <- retryOnTemporaryNetworkErrors $ liftIO $
+         makePost $
+         setBody (Aeson.encode pload) $
+         addHeaders [ajaxHeader] $
+         req
+  if | (responseStatus res) == created201 ->
+         do f <- fetchForm $ FormLinkName $ fromJust $ (responseBody res) ^? (key "form") . (key "link_name") . _String
+            (Right . Prelude.head) <$> (saveKnownForm f)
+     | otherwise ->
+         pure $ Left res
+
+  where
+    pload = Aeson.object [ "form" Aeson..= Aeson.object [ "display_name" Aeson..= fname ]]
+    saveKnownForm f = withDb $ \conn -> do
+      liftIO $ query conn "insert into forms(zoho_form_id, link_name, form_name) values(?, ?, ?) returning id, zoho_form_id, link_name, form_name"
+        ( fromJust $ f ^? (key "form_id") . _String
+        , fromJust $ f ^? (key "link_name") . _String
+        , fromJust $ f ^? (key "display_name") . _String
+        )
+
+fetchKnownFormByName :: Text -> AppM (Maybe (Int, ZohoFormId, FormLinkName, Text))
+fetchKnownFormByName fname = withDb $ \conn -> do
+  listToMaybe <$> (liftIO $ query conn "select id, zoho_form_id, link_name, form_name from forms where form_name=?" (Only fname))
+
+changeWaddoNames :: FormLinkName -> [Text] -> AppM _
+changeWaddoNames flink waddoNames = do
+  f <- fetchForm flink
+  req <- mkFormRequest flink Nothing
+  res <- retryOnTemporaryNetworkErrors $
+    makePut (Aeson.encode $ pload f) $
+    addHeaders [(hAccept, "application/zoho.forms.medium-v2+pageJson"), ajaxHeader] $
+    req
+  if (responseStatus res) == ok200
+    then pure Nothing
+    else pure $ Just res
+  where
+    emptyObject = Aeson.Object $ fromList []
+    jsonChoices = (flip DL.map) waddoNames $ \t ->
+      Aeson.object [ "id" Aeson..= ("" :: Text)
+                   , "value" Aeson..= t
+                   , "formula_val" Aeson..= ("" :: Text)
+                   ]
+    pload f =
+      let fields = f ^..  (key "pages") . (key "page") . (nth 0) . key ("fields") . values
+          newFields = (flip DL.map) fields $ \v ->
+            if v ^? (key "sequence_number") . _Number == Just 2
+            then v & (key "choices") .~ (Aeson.toJSON jsonChoices)
+            else emptyObject
+          withoutKeys = Aeson.Object $ f ^. _Object & sans ("enc_scheduled_status") . (sans "save_button_label") . (sans "show_save_button")
+          newForm = withoutKeys & (key "pages") . (key "page") . (nth 0) . key ("fields") .~ (Aeson.toJSON newFields)
+      in Aeson.object [ "form" Aeson..= newForm ]

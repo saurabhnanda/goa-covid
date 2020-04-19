@@ -78,6 +78,15 @@ dependencies:
   - resource-pool
   - case-insensitive
   - split
+  - retry
+  - lens-aeson
+  - streamly
+  - gogol-sheets
+  - gogol
+  - gogol-core
+  - gogol-oauth2
+  - gogol-drive
+  - token-bucket
 
 executables:
   goa-covid:

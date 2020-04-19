@@ -67,3 +67,13 @@ packages:
 extra-deps:
   - monad-validate-1.2.0.0@sha256:9850f408431098b28806dd464b6825a88a0b56c84f380d7fe0454c1df9d6f881,3505
   - servant-multipart-0.11.5@sha256:1633f715b5b53d648a1da69839bdc5046599f4f7244944d4bbf852dba38d8f4b,2319
+  - git: git@github.com:vacationlabs/gogol.git
+    commit: d537f62ba3a852da8f74fff9270c5bb2e868f3c5
+    subdirs:
+      - core
+      - gogol
+      - gogol-sheets
+      - gogol-drive
+      - gogol-oauth2
+  - token-bucket-0.1.0.1@sha256:d8e85f2fc373939975e7ace7907baee177531ab6e43df94e330a2357e64a2d11,1899
+
