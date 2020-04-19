@@ -27,6 +27,7 @@ import Servant.Multipart
 import Data.Text (Text)
 import UnliftIO (liftIO, catch, SomeException)
 import Control.Monad.Catch (throwM)
+import Control.Monad (void)
 
 data InvitationEmail = InvitationEmail
   { invHtml :: !Text
@@ -49,9 +50,9 @@ server = Routes
   { rInvitationEmailHandler = handleInivitationEmail
   }
 
-handleInivitationEmail InvitationEmail{..} = (flip catch) errhandler $ do
+handleInivitationEmail inv@InvitationEmail{..} = (flip catch) errhandler $ do
   if "invite" `T.isInfixOf` invSubject
-    then do liftIO $ doSignup (toS $ parseInvitationEmail invHtml)
+    then do liftIO $ doSignup inv (toS $ parseInvitationEmail invHtml)
             sayLine $ "Success (" <> invTo <> ", " <> invSubject <> ")"
             pure "ok"
     else do sayLine $ "Ignored (" <> invTo <> ", " <> invSubject <> ")"
@@ -87,6 +88,14 @@ makePost req = do
     withHeaders $
     req
 
+makeGet :: Request -> IO _
+makeGet req = do
+  mgr <- getGlobalManager
+  (flip httpLbs) mgr $
+    setMethod "GET" $
+    withHeaders $
+    req
+
 createUser :: Text -> IO _
 createUser email = do
   req <- (parseRequest "https://forms.zoho.com/REMOVED/users")
@@ -109,7 +118,7 @@ parseInvitationEmail email = do
       (Prelude.not $ "r=true" `T.isInfixOf` l)
 
 
-doSignup u = fetchSignupForm u >>= (submitSignupForm u)
+doSignup inv u = fetchSignupForm u >>= (submitSignupForm inv u)
 
 fetchSignupForm u = do
   mgr <- getGlobalManager
@@ -121,7 +130,7 @@ fetchSignupForm u = do
   pure $ responseCookieJar res
 
 -- submitSignupForm :: IO _
-submitSignupForm u cj = do
+submitSignupForm InvitationEmail{..} u cj = do
   mgr <- getGlobalManager
   req <- parseRequest "https://accounts.zoho.com/accounts/accinvite.ac"
   t <- getCurrentTime
@@ -150,13 +159,58 @@ submitSignupForm u cj = do
       case parseURI laxURIParserOptions (toS u) of
         Left e -> Prelude.error $ show e
         Right x -> fromJust $ DL.lookup "digest" $ x ^. queryL . queryPairsL
+
+    phone = DL.head $ T.splitOn "@" invTo 
     pload iamcsr = toQuery
-      [ ("firstname" :: BSL.ByteString, "Saurabh" :: BSL.ByteString)
-      , ("lastname", "Nanda")
-      , ("password", "pilot@9911")
+      [ ("firstname" :: BSL.ByteString, "Please" :: BSL.ByteString)
+      , ("lastname", "Provide")
+      , ("password", toS $ fromJust $ DL.lookup phone users)
       , ("iamcsrcoo", toS iamcsr)
       , ("servicename", "ZohoForms")
       , ("digest", toS digest_)
       , ("is_ajax", "true")
       ]
 
+data User = User
+  { userRole :: !Text
+  , userId :: !Text
+  , userEmail :: !Text
+  , userStatus :: !Text
+  } deriving (Eq, Show)
+
+data UserList = UserList { unUserList :: ![User] }  deriving (Eq, Show)
+
+instance FromJSON UserList where
+  parseJSON = withObject "Expecting object to parse into UserList"$ \o -> do
+    unUserList <- o .: "users"
+    pure UserList{..}
+
+instance FromJSON User where
+  parseJSON = withObject "Expecting object to parse into User"$ \o -> do
+    userRole <- o .: "role"
+    userId <- o .: "userid"
+    userEmail <- o .: "email"
+    userStatus <- o .: "status"
+    pure User{..}
+
+fetchUserList :: IO [User]
+fetchUserList = do
+  req <- parseRequest "https://forms.zoho.com/REMOVED/users"
+  res <- makeGet req
+  case eitherDecode (responseBody res) of
+    Left e -> Prelude.error e
+    Right r -> pure $ unUserList r
+
+shareForm :: Text -> [Text] -> IO ()
+shareForm formId emails = do
+  users <- fetchUserList
+  req <- parseRequest $ "https://forms.zoho.com/REMOVED/form/" <> toS formId <> "/share/private/users"
+  void $ makePost $ setBody (Aeson.encode pload) req
+  where
+    pload = Aeson.object [ "emailids" Aeson..= emails ]
+
+
+users :: [(Text, Text)]
+users =
+  [ ("9123456789", "REMOVED")
+  ]
