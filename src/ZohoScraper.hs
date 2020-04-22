@@ -575,6 +575,20 @@ deleteAllUnknownForms = do
               _ -> pure Nothing
 
 
+deleteAllForms :: AppM _
+deleteAllForms = do
+  fs <- liftIO $ fetchAllForms
+  S.toList $
+    S.maxThreads 20 $
+    S.asyncly $
+    S.mapMaybeM (liftIO . deleteForm) $
+    S.map go $
+    S.fromList fs
+  where
+    go :: Value -> FormLinkName
+    go f =
+      FormLinkName $ fromJust $ f ^? (key "link_name") . _String
+
 deleteForm :: FormLinkName -> IO _
 deleteForm flink = do
   req <- mkFormRequest flink (Just "trash")
@@ -648,7 +662,7 @@ changeWaddoNames flink waddoNames = do
 
 createReport :: FormLinkName -> Text -> AppM _
 createReport flink displayName = do
-  req <- parseRequest "https://forms.zoho.com/GoaCovidSurvey/reports"
+  req <- parseRequest "https://forms.zoho.com/REMOVED/reports"
   res <- makePost $
          setBody (Aeson.encode pload) $
          addHeaders [ajaxHeader] $
@@ -704,7 +718,7 @@ fetchReportCounts = local (\r -> r{envBurstSize = 3, envInvRate = round (1e6 / 0
   where
     go (rlink, displayName) = do
       req <- parseRequest $
-             "https://forms.zoho.com/GoaCovidSurvey/report/" <> (toS $ unReportLinkName rlink) <> "/records?start=1&pageSize=10"
+             "https://forms.zoho.com/REMOVED/report/" <> (toS $ unReportLinkName rlink) <> "/records?start=1&pageSize=10"
       res <- makeGet $
              addHeaders [(hAccept, "application/json"), ajaxHeader] $
              req
@@ -728,7 +742,7 @@ fetchWaddoCounts flink waddoNames = local (\r -> r{envBurstSize = 3, envInvRate 
   where
     go waddoName = do
       req <- parseRequest $
-             "https://forms.zoho.com/GoaCovidSurvey/report/" <> (toS $ unFormLinkName flink) <> "_Report/records"
+             "https://forms.zoho.com/REMOVED/report/" <> (toS $ unFormLinkName flink) <> "_Report/records"
       res <- retryOnTemporaryNetworkErrors $ makePost $
              setBody (Aeson.encode $ pload waddoName) $
              addHeaders [(hAccept, "application/json"), ajaxHeader, (hContentType, "application/json")] $
@@ -777,7 +791,7 @@ fetchEntryCounts flag = local (\r -> r{envBurstSize = 3, envInvRate = round (1e6
           False -> pure $ S.fromList []
     go (_, _, rlink, displayName) = do
       req <- parseRequest $
-             "https://forms.zoho.com/GoaCovidSurvey/report/" <> (toS $ unFormLinkName rlink) <> "_Report/records?start=1&pageSize=10"
+             "https://forms.zoho.com/REMOVED/report/" <> (toS $ unFormLinkName rlink) <> "_Report/records?start=1&pageSize=10"
       res <- retryOnTemporaryNetworkErrors $ makeGet $
              addHeaders [(hAccept, "application/json"), ajaxHeader] $
              req
@@ -869,7 +883,7 @@ deactivateAllUsers = local (\r -> r{envBurstSize = 10, envInvRate = round (1e6/3
 
 deactivateUser :: (Text, ZohoUserId, Maybe FormLinkName) -> AppM _
 deactivateUser (email, zuid, flink) = do
-  req <- parseRequest $ "https://forms.zoho.com/GoaCovidSurvey/user/" <> toS (unZohoUserId zuid) <> "/status"
+  req <- parseRequest $ "https://forms.zoho.com/REMOVED/user/" <> toS (unZohoUserId zuid) <> "/status"
   res <- retryOnTemporaryNetworkErrors $ makePost $
          setBody (Aeson.encode pload) $
          addHeaders [ajaxHeader] $
@@ -916,7 +930,7 @@ downloadAllCsvReports outDir = do
 
 downloadCsvReport :: FormLinkName -> FilePath -> _
 downloadCsvReport flink outFile = do
-  req <- parseRequest $ "https://forms.zoho.com/exportdata?portalname=GoaCovidSurvey&reportlinkname=" <>
+  req <- parseRequest $ "https://forms.zoho.com/exportdata?portalname=REMOVED&reportlinkname=" <>
          (toS $ unFormLinkName flink) <> "_Report&exporttype=csv&filename=" <> (toS $ unFormLinkName flink) <> ".csv"
   mgr <- getGlobalManager
   let finalReq = addHeaders [ajaxHeader] $
